@@ -1,0 +1,9 @@
+[submodule "legalbench"]
+	path = legalbench
+	url = https://huggingface.co/datasets/nguha/legalbench
+[submodule "FinQA"]
+	path = FinQA
+	url = git@github.com:czyssrs/FinQA.git
+[submodule "mctest"]
+	path = mctest
+	url = git@github.com:mcobzarenco/mctest.git

@@ -1,9 +1,12 @@
 import json
+import random
+from argparse import ArgumentParser
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 import pandas as pd
+from datasets import load_dataset
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -435,6 +438,135 @@ MAUD_TASKS: Final[dict[str, Task]] = {
 }
 
 
+def format_table_as_text(table: list[list[str]]) -> str:
+    if not table:
+        return ""
+
+    cleaned_table = []
+    for row in table:
+        cleaned_row = []
+        for cell in row:
+            cell_str = str(cell).strip()
+            cleaned_row.append(cell_str)
+        cleaned_table.append(cleaned_row)
+
+    if not cleaned_table:
+        return ""
+
+    col_widths = []
+    for col_idx in range(len(cleaned_table[0])):
+        max_width = 0
+        for row in cleaned_table:
+            if col_idx < len(row):
+                max_width = max(max_width, len(row[col_idx]))
+        col_widths.append(max_width)
+
+    formatted_lines = []
+    for i, row in enumerate(cleaned_table):
+        # Pad each cell to its column width
+        padded_cells = []
+        for j, cell in enumerate(row):
+            if j < len(col_widths):
+                padded_cells.append(cell.ljust(col_widths[j]))
+            else:
+                padded_cells.append(cell)
+
+        formatted_line = " | ".join(padded_cells)
+        formatted_lines.append(formatted_line)
+
+        if i == 0 and len(cleaned_table) > 1:
+            separator = " | ".join(["-" * width for width in col_widths])
+            formatted_lines.append(separator)
+
+    return "\n".join(formatted_lines)
+
+
+def generate_plausible_answers(
+    correct_answer: float, question: str
+) -> list[tuple[str, str]]:
+    variations = [
+        round(correct_answer * 0.8, 1),
+        round(correct_answer * 1.2, 1),
+        round(correct_answer * 0.5, 1),
+        round(correct_answer * 1.5, 1),
+        round(correct_answer + 10, 1),
+        round(correct_answer - 10, 1),
+        round(correct_answer * -1, 1),
+    ]
+    variations = [v for v in set(variations) if v != correct_answer and v != 0]
+
+    wrong_answers = random.sample(variations, min(3, len(variations)))
+
+    while len(wrong_answers) < 3:
+        if "percent" in question.lower() or "%" in question.lower():
+            wrong_answers.append(round(correct_answer + random.uniform(-20, 20), 1))
+        else:
+            wrong_answers.append(round(correct_answer + random.uniform(-50, 50), 1))
+
+    all_answers = [correct_answer] + wrong_answers[:3]
+    random.shuffle(all_answers)
+
+    letters = ["A", "B", "C", "D"]
+    answer_choices = [(letters[i], str(all_answers[i])) for i in range(4)]
+
+    correct_letter = None
+    for letter, value in answer_choices:
+        if float(value) == correct_answer:
+            correct_letter = letter
+            break
+
+    return answer_choices, correct_letter
+
+
+def process_finqa_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    pre_text = record.get("pre_text", [])
+    post_text = record.get("post_text", [])
+    table = record.get("table", [])
+    qa = record.get("qa", {})
+
+    text_parts = []
+
+    if pre_text:
+        text_parts.extend(pre_text)
+        text_parts.append("")
+    if table:
+        text_parts.append(format_table_as_text(table))
+        text_parts.append("")
+    if post_text:
+        text_parts.extend(post_text)
+
+    formatted_text = "\n".join(text_parts)
+    question = qa.get("question", "")
+
+    try:
+        if not qa["answer"]:
+            correct_answer = qa["exe_ans"] * 100
+            answer_choices, correct_letter = generate_plausible_answers(
+                correct_answer, question
+            )
+        else:
+            if qa["answer"] in ("yes", "no"):
+                answer_choices = [("A", "yes"), ("B", "no")]
+                correct_letter = 0 if qa["answer"] == "yes" else 1
+            else:
+                correct_answer = float(qa.get("answer", 0).replace("%", ""))
+                answer_choices, correct_letter = generate_plausible_answers(
+                    correct_answer, question
+                )
+    except Exception as e:
+        print(f"WARN: {e}")
+        return None
+
+    return {
+        "domain": "finance",
+        "task_id": "finqa",
+        "text": formatted_text,
+        "question": question,
+        "answers": json.dumps(answer_choices),
+        "answer": correct_letter,
+    }
+
+
 def prep_legal() -> pd.DataFrame:
     dfs = []
     for task_name, task in MAUD_TASKS.items():
@@ -451,8 +583,166 @@ def prep_legal() -> pd.DataFrame:
     return maud_df
 
 
+def prep_medical() -> pd.DataFrame:
+    ds = load_dataset("qiaojin/PubMedQA", "pqa_labeled")["train"]
+    df = ds.to_pandas()[["pubid", "context", "question", "final_decision"]]
+
+    def map_to_answer(decision: str) -> str:
+        match decision:
+            case "yes":
+                return "A"
+            case "no":
+                return "B"
+            case "maybe":
+                return "C"
+            case _:
+                raise KeyError("Invalid decision")
+
+    return pd.DataFrame(
+        {
+            "domain": "medical",
+            "task_id": "pubmedqa",
+            "text": df.apply(lambda row: "\n".join(row["context"]["contexts"]), axis=1),
+            "question": df["question"],
+            "answers": json.dumps([("A", "yes"), ("B", "no"), ("C", "maybe")]),
+            "answer": df["final_decision"].map(map_to_answer),
+        }
+    )
+
+
+def prep_financial() -> pd.DataFrame:
+    with open("./FinQA/dataset/test.json", "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    processed_records = []
+    for record in data:
+        processed_record = process_finqa_record(record)
+        if processed_record is not None:
+            processed_records.append(processed_record)
+
+    return pd.DataFrame(processed_records)
+
+
+def prep_reading_comprehension() -> pd.DataFrame:
+    with open("./mctest/data/MCTest/mc500.test.tsv", "r", encoding="utf-8") as f:
+        tsv_lines = f.read().strip().split("\n")
+    with open("./mctest/data/MCTestAnswers/mc500.test.ans", "r", encoding="utf-8") as f:
+        ans_lines = f.read().strip().split("\n")
+
+        all_rows = []
+
+    for tsv_line, ans_line in zip(tsv_lines, ans_lines):
+        tsv_parts = tsv_line.split("\t")
+
+        story = tsv_parts[2].replace("\\newline", "\n").replace("\\tab", "\t")
+
+        questions_data = []
+        for q_idx in range(4):
+            start_idx = 3 + (q_idx * 5)
+            if start_idx + 4 < len(tsv_parts):
+                question_text = tsv_parts[start_idx]
+
+                clean_question = question_text
+                if question_text.startswith("one:"):
+                    clean_question = question_text[4:].strip()
+                elif question_text.startswith("multiple:"):
+                    clean_question = question_text[9:].strip()
+
+                answer_a = tsv_parts[start_idx + 1]
+                answer_b = tsv_parts[start_idx + 2]
+                answer_c = tsv_parts[start_idx + 3]
+                answer_d = tsv_parts[start_idx + 4]
+
+                questions_data.append(
+                    {
+                        "question": clean_question,
+                        "choices": [
+                            ("A", answer_a),
+                            ("B", answer_b),
+                            ("C", answer_c),
+                            ("D", answer_d),
+                        ],
+                    }
+                )
+
+        correct_answers = ans_line.split("\t")
+
+        for q_idx, question_data in enumerate(questions_data):
+            if q_idx < len(correct_answers):
+                correct_answer = correct_answers[q_idx].strip()
+
+                row = {
+                    "domain": "reading_comprehension",
+                    "task_id": "mc500",
+                    "text": story,
+                    "question": question_data["question"],
+                    "answers": json.dumps(question_data["choices"]),
+                    "answer": correct_answer,
+                }
+                all_rows.append(row)
+
+    return pd.DataFrame(all_rows)
+
+
+def parse_args():
+    parser = ArgumentParser()
+    parser.add_argument("--output")
+    parser.add_argument("--target-size", default=600)
+    parser.add_argument("--random-seed", default=42)
+    return parser.parse_args()
+
+
 def main():
-    print(prep_legal())
+    args = parse_args()
+
+    target_size = args.target_size
+    random_seed = args.random_seed
+
+    random.seed(random_seed)
+
+    legal = prep_legal()
+    medical = prep_medical()
+    financial = prep_financial()
+    rc = prep_reading_comprehension()
+
+    balanced_dfs = []
+
+    rc_balanced = rc.sample(n=target_size, replace=False, random_state=random_seed)
+    balanced_dfs.append(rc_balanced)
+
+    medical_balanced = medical.sample(
+        n=target_size, replace=False, random_state=random_seed
+    )
+    balanced_dfs.append(medical_balanced)
+
+    financial_balanced = financial.sample(
+        n=target_size, replace=False, random_state=random_seed
+    )
+    balanced_dfs.append(financial_balanced)
+
+    legal_tasks = legal["task_id"].unique()
+    samples_per_task = target_size // len(legal_tasks)
+    remainder = target_size % len(legal)
+
+    legal_samples = []
+    for i, task in enumerate(legal_tasks):
+        task_df = legal[legal["task_id"] == task]
+        n_samples = samples_per_task + (1 if i < remainder else 0)
+        n_samples = min(n_samples, len(task_df))
+        task_sample = task_df.sample(
+            n=n_samples, replace=False, random_state=random_seed
+        )
+        legal_samples.append(task_sample)
+
+    legal_balanced = pd.concat(legal_samples, ignore_index=True)
+    balanced_dfs.append(legal_balanced)
+
+    cross_domain_dataset = pd.concat(balanced_dfs, ignore_index=True)
+    cross_domain_dataset = cross_domain_dataset.sample(
+        frac=1, random_state=random_seed
+    ).reset_index(drop=True)
+
+    cross_domain_dataset.to_csv(args.output, index=False)
 
 
 if __name__ == "__main__":
